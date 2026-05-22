@@ -1,0 +1,21 @@
+{
+  "name": "notina-relay",
+  "version": "1.0.0",
+  "description": "Relay server for Notina voice transcription",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "multer": "^2.1.1",
+    "openai": "^6.34.0",
+    "ws": "^8.20.1"
+  }
+}
