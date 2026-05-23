@@ -409,28 +409,54 @@ app.post('/api/ai-check-memo', async (req, res) => {
 
 app.post('/api/query-memos', async (req, res) => {
   try {
-    const { query = '', memos = [] } = req.body ?? {};
+    const { query = '', memos = [], now = new Date().toISOString() } = req.body ?? {};
     const cleanQuery = normalizeText(query);
+    const nowDate = new Date(now);
+    const nowMs = isNaN(nowDate.getTime()) ? Date.now() : nowDate.getTime();
 
     const safeMemos = Array.isArray(memos)
       ? memos
           .filter((m) => m && typeof m.text === 'string')
-          .map((m) => ({
-            id: String(m.id ?? ''),
-            text: normalizeText(m.text),
-          }))
+          .map((m) => {
+            const createdMs = m.createdAt ? new Date(m.createdAt).getTime() : nowMs;
+            const ageDays = Math.max(0, Math.floor((nowMs - createdMs) / (1000 * 60 * 60 * 24)));
+            return {
+              id: String(m.id ?? ''),
+              text: normalizeText(m.text),
+              done: m.done === true,
+              doneAt: m.doneAt ?? null,
+              ageDays,
+            };
+          })
           .filter((m) => m.id && m.text)
       : [];
 
-    console.log('[relay-query] POST /api/query-memos:', {
-      query: cleanQuery,
-      memoCount: safeMemos.length,
-    });
+    // Detect if the query is asking about completed items
+    const queryLower = cleanQuery.toLowerCase();
+    const isDoneQuery = [
+      'kész', 'elintézett', 'megcsináltam', 'befejezet', 'elvégzet',
+      'amit már', 'lezárt', 'kész teendő',
+    ].some((kw) => queryLower.includes(kw));
+
+    const filteredMemos = safeMemos.filter((m) => m.done === isDoneQuery);
 
     if (!cleanQuery) {
       res.status(400).json({ ok: false, error: 'Missing query', message: 'A kérdés hiányzik.' });
       return;
     }
+
+    console.log('[relay-query] POST /api/query-memos:', {
+      query: cleanQuery,
+      totalMemos: safeMemos.length,
+      filteredCount: filteredMemos.length,
+      isDoneQuery,
+    });
+
+    const memoList = filteredMemos.map((m) => ({
+      id: m.id,
+      text: m.text,
+      kor: `${m.ageDays} nap`,
+    }));
 
     const response = await client.responses.create({
       model: 'gpt-4.1-mini',
@@ -441,15 +467,43 @@ app.post('/api/query-memos', async (req, res) => {
             {
               type: 'input_text',
               text:
-                'Te egy személyes memo appban segítesz a usernek. ' +
-                'Kapsz egy KÉRDÉST vagy FELADATOT, és a felhasználó összes feljegyzését. ' +
-                'Válaszolj magyarul, a memo-k alapján.\n\n' +
-                'Ha a kérdés arra irányul, hogy listázz ki bizonyos feltételeknek megfelelő feljegyzéseket ' +
-                '(pl. "sorold fel", "mutasd meg", "milyen", "melyik"), ' +
-                'akkor response_type="list" és adj vissza memo_ids tömböt az illeszkedő memo-k id-jaival. ' +
-                'Minden más esetben response_type="text" és adj egy rövid, természetes választ text_answer-ben.\n\n' +
-                'Ne találj ki memo-kat. Csak a megadott listából hivatkozz. ' +
-                'Ha nincs releváns memo, mondd meg szövegesen (text válaszként).',
+                'Te egy személyes memo appban segítesz prioritizálni és lekérdezni a hangból rögzített feljegyzéseket. ' +
+                'Nincs tárolt metaadat — csak a memo szövege és kora (napokban) az alapja minden döntésnek.\n\n' +
+                'FELADATOD:\n' +
+                '– Ha a kérdés ÁTTEKINTÉST kér (pl. "mi a dolgom ma?", "mik a teendőim?", "mi sürgős?", ' +
+                '"foglald össze mit kell tennem", "prioritizáld", "mivel kellene foglalkoznom"), ' +
+                'válaszolj response_type="prioritized"-del és töltsd ki a groups tömböt.\n' +
+                '– Lista kérésnél (pl. "sorold fel", "mutasd meg", "milyen", "melyik"): response_type="list", ' +
+                'memo_ids az illeszkedő id-k.\n' +
+                '– Minden más specifikus kérdésnél: response_type="text", text_answer-ben rövid válasz.\n\n' +
+                'PRIORITIZÁLÁS — 4 szint:\n\n' +
+                '🔴 urgent (SÜRGŐS — ég a körmödre):\n' +
+                '  – Explicit közeli határidő: ma, holnap, holnapután, "péntekig", konkrét közeli dátum, "héten belül"\n' +
+                '  – Erős sürgető megfogalmazás: "azonnal", "sürgős", "muszáj", "nagyon várják", "ne felejtsem el ma"\n' +
+                '  – VAGY: 14+ napos ÉS időérzékeny tartalom (valaki vár rá, közelgő esemény, lejáró határidő)\n\n' +
+                '🟡 important (FONTOS, DE VÁR):\n' +
+                '  – Van konkrét teendő-szándék, de nincs közeli határidő és nem sürgető\n' +
+                '  – Pl. "hívjam fel Lacit", "el kell intézni a fogszabályozót"\n\n' +
+                '⚪ later (RÁÉR / ÖTLET):\n' +
+                '  – "Valamikor", "jó lenne", ötletek, hosszú távú tervek, semmi sürgető\n' +
+                '  – Pl. "megnézni azt a filmet amit Anna ajánlott"\n\n' +
+                '🔵 stale (ROHAD — nézd meg):\n' +
+                '  – 14+ napos, a tartalom alapján teendő (nem ötlet), de NEM időérzékeny vagy sürgős\n' +
+                '  – Érdemes rákérdezni: még aktuális-e?\n\n' +
+                'PÉLDÁK:\n' +
+                '  – "Holnap reggel hívjam fel a könyvelőt" → urgent (konkrét közeli idő)\n' +
+                '  – "Befizetni a biztosítást péntekig" → urgent (határidő)\n' +
+                '  – "El kell menni fogorvoshoz" + kor 3 nap → important\n' +
+                '  – "Válaszolni kéne Kovács úrnak" + kor 20 nap → stale\n' +
+                '  – "Megnézni azt a könyvet amit Anna ajánlott" → later\n' +
+                '  – "Jó lenne megtanulni gitározni" → later\n\n' +
+                'SZABÁLYOK:\n' +
+                '  – Csak a megadott memo-kra hivatkozz, ne találj ki semmit\n' +
+                '  – groups-ban csak nem üres csoportok szerepeljenek; sorrendjük: urgent, important, stale, later\n' +
+                '  – text_answer: rövid, természetes, TTS-barát összefoglaló (autóban hallgatva is érthető); ' +
+                'prioritized esetén a sürgős elemeket sorolja fel elsőként; text esetén is töltsd ki; ' +
+                'list esetén null\n' +
+                '  – Ha nincs egyetlen memo sem, jelezd szövegesen a text_answer-ben',
             },
           ],
         },
@@ -460,7 +514,7 @@ app.post('/api/query-memos', async (req, res) => {
               type: 'input_text',
               text:
                 `Kérdés/feladat: "${cleanQuery}"\n\n` +
-                `Feljegyzések:\n${JSON.stringify(safeMemos, null, 2)}`,
+                `Feljegyzések:\n${JSON.stringify(memoList, null, 2)}`,
             },
           ],
         },
@@ -468,20 +522,33 @@ app.post('/api/query-memos', async (req, res) => {
       text: {
         format: {
           type: 'json_schema',
-          name: 'memo_query_result',
+          name: 'memo_query_result_v2',
           strict: true,
           schema: {
             type: 'object',
             additionalProperties: false,
             properties: {
-              response_type: { type: 'string', enum: ['text', 'list'] },
+              response_type: { type: 'string', enum: ['text', 'list', 'prioritized'] },
               text_answer: { type: ['string', 'null'] },
               memo_ids: {
                 type: 'array',
                 items: { type: 'string' },
               },
+              groups: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    level: { type: 'string', enum: ['urgent', 'important', 'later', 'stale'] },
+                    memo_ids: { type: 'array', items: { type: 'string' } },
+                    summary: { type: 'string' },
+                  },
+                  required: ['level', 'memo_ids', 'summary'],
+                },
+              },
             },
-            required: ['response_type', 'text_answer', 'memo_ids'],
+            required: ['response_type', 'text_answer', 'memo_ids', 'groups'],
           },
         },
       },
@@ -496,14 +563,28 @@ app.post('/api/query-memos', async (req, res) => {
       throw new Error('A query-memos válasz nem volt értelmezhető JSON.');
     }
 
+    const groups = Array.isArray(parsed.groups)
+      ? parsed.groups.map((g) => ({
+          level: g.level,
+          memo_ids: Array.isArray(g.memo_ids) ? g.memo_ids : [],
+          summary: typeof g.summary === 'string' ? g.summary : '',
+        }))
+      : [];
+
     const result = {
       ok: true,
       response_type: parsed.response_type ?? 'text',
       text_answer: parsed.text_answer ?? null,
       memo_ids: Array.isArray(parsed.memo_ids) ? parsed.memo_ids : [],
+      groups,
     };
 
-    console.log('[relay-query] /api/query-memos result:', result);
+    console.log('[relay-query] /api/query-memos result:', {
+      response_type: result.response_type,
+      isDoneQuery,
+      filteredCount: filteredMemos.length,
+      groupSizes: groups.map((g) => `${g.level}:${g.memo_ids.length}`).join(', ') || '(none)',
+    });
 
     res.json(result);
   } catch (error) {
@@ -1029,21 +1110,41 @@ app.post('/api/match-command-audio', upload.single('file'), async (req, res) => 
 });
 
 app.post('/api/tts', async (req, res) => {
-  const { text, voice = 'onyx' } = req.body ?? {};
+  const { text, voice = 'marin' } = req.body ?? {};
 
   if (typeof text !== 'string' || !text.trim()) {
     return res.status(400).json({ ok: false, error: 'Missing text' });
   }
 
+  const TTS_PARAMS = {
+    model: 'gpt-4o-mini-tts',
+    input: text.trim(),
+    response_format: 'mp3',
+    speed: 1.2,
+    instructions: 'Speak in a natural, warm, conversational Hungarian tone — like a friendly assistant, not a robot. Keep a brisk, confident pace. Use clearly rising intonation for sentences that end with a question mark.',
+  };
+
+  async function createSpeech(useVoice) {
+    return client.audio.speech.create({ ...TTS_PARAMS, voice: useVoice });
+  }
+
+  function isVoiceError(error) {
+    const msg = (error?.message ?? '').toLowerCase();
+    return msg.includes('voice') || msg.includes('invalid_request_error');
+  }
+
   try {
-    const mp3 = await client.audio.speech.create({
-      model: 'gpt-4o-mini-tts',
-      voice,
-      input: text.trim(),
-      response_format: 'mp3',
-      speed: 1.15,
-      instructions: 'Speak in a natural, warm, conversational Hungarian tone — like a friendly assistant, not a robot. Keep a brisk, confident pace. Use clearly rising intonation for sentences that end with a question mark.',
-    });
+    let mp3;
+    try {
+      mp3 = await createSpeech(voice);
+    } catch (error) {
+      if (isVoiceError(error)) {
+        console.warn(`[TTS] Voice '${voice}' not available, retrying with 'coral'. Error: ${error.message}`);
+        mp3 = await createSpeech('coral');
+      } else {
+        throw error;
+      }
+    }
 
     const buffer = Buffer.from(await mp3.arrayBuffer());
     res.setHeader('Content-Type', 'audio/mpeg');
@@ -1250,6 +1351,75 @@ app.post('/api/interpret-cancel-confirm', async (req, res) => {
   } catch (error) {
     console.error('interpret-cancel-confirm error:', error);
     res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/refine-query', async (req, res) => {
+  try {
+    const { previousQuery = '', newSpeech = '' } = req.body ?? {};
+    const cleanPrev = normalizeText(previousQuery);
+    const cleanNew = normalizeText(newSpeech);
+
+    if (!cleanNew) {
+      return res.json({ ok: true, refinedQuery: cleanPrev });
+    }
+    if (!cleanPrev) {
+      return res.json({ ok: true, refinedQuery: cleanNew });
+    }
+
+    console.log('[relay-refine] POST /api/refine-query:', { previousQuery: cleanPrev, newSpeech: cleanNew });
+
+    const response = await client.responses.create({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          role: 'system',
+          content: [{
+            type: 'input_text',
+            text:
+              'Egy felhasználónak volt egy kérdése egy hangjegyzet-apphoz. Ezután még mondott valamit. ' +
+              'Döntsd el:\n' +
+              '- Ha az új mondanivaló MÓDOSÍTJA az előző kérdést (pl. "inkább csak a sürgősek", ' +
+              '"és a tegnapiakat is", "nem holnap, hanem ma"), add vissza egy egységes, módosított kérdést.\n' +
+              '- Ha az új mondanivaló TELJESEN ÚJ kérdés (pl. "listázd a könyveket", "mi van a bevásárló listán"), ' +
+              'add vissza az új kérdést.\n\n' +
+              'A refinedQuery legyen rövid, természetes, egyetlen kérdés vagy kérés magyarul. ' +
+              'Ne magyarázz, ne adj alternatívákat.',
+          }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: `Előző kérdés: "${cleanPrev}"\n\nÚj mondanivaló: "${cleanNew}"`,
+          }],
+        },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'refined_query',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              refinedQuery: { type: 'string' },
+            },
+            required: ['refinedQuery'],
+          },
+        },
+      },
+    });
+
+    const parsed = JSON.parse(response.output_text || '{}');
+    const refinedQuery = normalizeText(parsed.refinedQuery || cleanNew);
+
+    console.log('[relay-refine] result:', { refinedQuery });
+    res.json({ ok: true, refinedQuery });
+  } catch (error) {
+    console.error('refine-query error:', error);
+    res.status(500).json({ ok: false, error: error instanceof Error ? error.message : 'Unknown error' });
   }
 });
 
