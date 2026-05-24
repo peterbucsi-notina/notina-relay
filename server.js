@@ -1423,6 +1423,306 @@ app.post('/api/refine-query', async (req, res) => {
   }
 });
 
+app.post('/api/detect-intent', async (req, res) => {
+  try {
+    const { text = '' } = req.body ?? {};
+    const inputText = normalizeText(text);
+
+    if (!inputText) {
+      return res.status(400).json({ ok: false, error: 'Missing text', message: 'A szöveg hiányzik.' });
+    }
+
+    console.log('[relay-intent] POST /api/detect-intent:', { text: inputText });
+
+    const response = await client.responses.create({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          role: 'system',
+          content: [{
+            type: 'input_text',
+            text:
+              'Magyar hangbemondásból döntsd el, mit szeretne a felhasználó egy hangjegyzet-alkalmazásban.\n\n' +
+              'Három szándék egyike lehetséges. CSAK KÉT SZÁNDÉKOT azonosíts aktívan — minden más az alapértelmezett.\n\n' +
+              '"new_memo" — KIZÁRÓLAG akkor, ha a felhasználó egyértelműen ÚJ rögzítési szándékot fejez ki ' +
+              'rövid, jellegzetes "most kezdek diktálni" fordulattal. Tipikus példák:\n' +
+              '  – "mondom", "mondanék valamit", "mondok valamit"\n' +
+              '  – "új bejegyzés", "új jegyzet", "feljegyeznék valamit"\n' +
+              '  – "diktálok", "diktálnék", "felvenném", "rögzítek valamit"\n' +
+              '  – "megjegyeznék valamit", "felírnék valamit"\n' +
+              'Ezek rövid szándéknyilatkozatok — NEM teljes tartalom (pl. "holnap orvos" nem ide tartozik).\n\n' +
+              '"query" — KIZÁRÓLAG akkor, ha a felhasználó egyértelműen kérdez, keres vagy áttekintést kér. Tipikus példák:\n' +
+              '  – "kérdezek", "kérdeznék valamit", "kérdésem van"\n' +
+              '  – "mi a dolgom", "mi sürgős", "mit kell elvégeznem", "mi van a listán"\n' +
+              '  – "listázd", "sorold fel", "foglald össze", "mutasd meg"\n' +
+              '  – "készíts bevásárló listát", "mi a legfontosabb", "mivel kezdjem"\n\n' +
+              '"modify_memo" — MINDEN MÁS. Ha a szöveg nem illik egyértelműen a fenti két kategória egyikébe, ' +
+              'a válasz: "modify_memo". A felhasználó feltételezhetően egy meglévő bejegyzést javít, egészít ki, ' +
+              'vagy tartalom-jellegű mondatot mond — amit a rendszer megpróbál meglévő bejegyzéshez rendelni.\n\n' +
+              'KRITIKUS SZABÁLY: NE próbáld felismerni a módosítási jeleket — csak a két szűk kategóriát ' +
+              '(new_memo, query) azonosítsd aktívan. Kétség esetén az alapértelmezett: "modify_memo".\n' +
+              'Csak a szándékot azonosítsd, ne javítsd a szöveget.',
+          }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'input_text', text: inputText }],
+        },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'intent_detection',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              intent: { type: 'string', enum: ['new_memo', 'query', 'modify_memo'] },
+            },
+            required: ['intent'],
+          },
+        },
+      },
+    });
+
+    let parsed = { intent: 'new_memo' };
+    try {
+      parsed = JSON.parse(response.output_text || '{}');
+    } catch (parseError) {
+      console.error('[relay-intent] JSON parse error:', parseError);
+    }
+
+    const intent = ['new_memo', 'query'].includes(parsed.intent) ? parsed.intent : 'modify_memo';
+
+    console.log('[relay-intent] result:', { intent, text: inputText });
+
+    res.json({ ok: true, intent, text: inputText });
+  } catch (error) {
+    console.error('Failed to detect intent:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to detect intent',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+app.post('/api/match-and-modify-memo', async (req, res) => {
+  try {
+    const { instruction = '', memos = [] } = req.body ?? {};
+    const cleanInstruction = normalizeText(instruction);
+
+    const safeMemos = Array.isArray(memos)
+      ? memos
+          .filter((m) => m && typeof m.id === 'string' && typeof m.text === 'string')
+          .map((m) => ({ id: m.id.trim(), text: normalizeText(m.text) }))
+          .filter((m) => m.id && m.text)
+      : [];
+
+    console.log('[relay-modify] POST /api/match-and-modify-memo:', {
+      instruction: cleanInstruction,
+      memoCount: safeMemos.length,
+    });
+
+    if (!cleanInstruction) {
+      return res.status(400).json({ ok: false, error: 'Missing instruction', message: 'A módosítási utasítás hiányzik.' });
+    }
+
+    if (safeMemos.length === 0) {
+      return res.json({ ok: true, matched: false, memo_id: null, confidence: 'low', modified_text: null, candidates: [] });
+    }
+
+    const memoList = safeMemos.map((m) => ({ id: m.id, text: m.text }));
+
+    const response = await client.responses.create({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          role: 'system',
+          content: [{
+            type: 'input_text',
+            text:
+              'Te egy magyar hangjegyzet-alkalmazás asszisztense vagy. A felhasználó bemondott valamit, ' +
+              'és meg kell állapítanod, hogy az TÉMAILAG megfelel-e valamely meglévő feljegyzésnek — ' +
+              'azaz a felhasználó valószínűleg azt a feljegyzést akarta javítani, kiegészíteni.\n\n' +
+              'Az utasítás egy rövid hangfelvétel STT átirata — tartalmazhat kiejtési hibákat.\n\n' +
+              'AZ EGYEZÉS KRITÉRIUMA — SZIGORÚ:\n' +
+              'Egy feljegyzés CSAK akkor illik az utasításhoz, ha az utasítás TÉMAILAG ugyanarról szól, ' +
+              'mint a feljegyzés. Az utasítás lényegének plausibilisen kell kapcsolódnia a feljegyzés ' +
+              'tartalmához — mintha a felhasználó azt a konkrét feljegyzést szeretné módosítani.\n\n' +
+              'NEM ELEGENDŐ az egyezéshez:\n' +
+              '– hogy mindkettő "vásárlásról" szól általában\n' +
+              '– hogy hasonló kategóriába esnek (pl. mindkettő tennivaló)\n' +
+              '– hogy az utasítás szavai esetleg előfordulnak valahol a feljegyzésben\n' +
+              'SZÜKSÉGES az egyezéshez:\n' +
+              '– az utasítás KONKRÉT TÁRGYA szerepel (vagy egyértelműen következik) a feljegyzésből\n\n' +
+              'PÉLDÁK:\n' +
+              '✓ Feljegyzés: "vegyek cukrot" | Utasítás: "a cukorból két kilót, nem egyet" → egyezik (ugyanaz a tárgy: cukor)\n' +
+              '✗ Feljegyzés: "vegyek sárgarépát, cukrot" | Utasítás: "Szeretnék egy autót venni" → NEM egyezik (autó nincs a feljegyzésben)\n' +
+              '✓ Feljegyzés: "holnap hívom fel Lacit" | Utasítás: "inkább holnapután hívjam" → egyezik (ugyanaz: Laci hívása)\n' +
+              '✗ Feljegyzés: "holnap hívom fel Lacit" | Utasítás: "el kell küldeni az emailt Kovácsnak" → NEM egyezik (más személy, más cselekvés)\n\n' +
+              'EGYEZTETÉSI SZABÁLYOK:\n' +
+              '– Ha EGYETLEN feljegyzés egyértelműen illik (témailag): candidate_ids = [az_az_egy_id], confidence = "high"\n' +
+              '– Ha TÖBB feljegyzés is VALÓBAN szóba jöhet: candidate_ids = [azok_id-i], confidence = "low"\n' +
+              '– Ha EGYIK SEM illik témailag: candidate_ids = [], confidence = "low"\n\n' +
+              'KRITIKUS: A "nem illik" (üres candidate_ids) HELYES és ELVÁRT kimenet, ha az utasítás ' +
+              'tárgya nem szerepel egyik feljegyzésben sem. Jobb nem egyezni, mint egy félrevezető módosítást elvégezni.\n\n' +
+              'Ha confidence = "high": töltsd ki a modified_text mezőt. A módosítást a LEHETŐ LEGKISEBB ' +
+              'mértékben végezd — csak azt változtasd, ami az utasítás szerint tényleg megváltozott.\n' +
+              'Ha confidence = "low": modified_text legyen null.\n\n' +
+              'FONTOS: candidate_ids-ben CSAK a megadott listában szereplő id lehet. Soha ne találj ki id-t.',
+          }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text:
+              `Módosítási utasítás: "${cleanInstruction}"\n\n` +
+              `Feljegyzések:\n${JSON.stringify(memoList, null, 2)}`,
+          }],
+        },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'match_and_modify_memo',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              candidate_ids: { type: 'array', items: { type: 'string' } },
+              confidence: { type: 'string', enum: ['high', 'low'] },
+              modified_text: { type: ['string', 'null'] },
+            },
+            required: ['candidate_ids', 'confidence', 'modified_text'],
+          },
+        },
+      },
+    });
+
+    let parsed = { candidate_ids: [], confidence: 'low', modified_text: null };
+    try {
+      parsed = JSON.parse(response.output_text || '{}');
+    } catch (parseError) {
+      console.error('[relay-modify] JSON parse error:', parseError);
+    }
+
+    // Validate candidate_ids against actual memo ids to prevent hallucination
+    const validIds = new Set(safeMemos.map((m) => m.id));
+    const candidateIds = Array.isArray(parsed.candidate_ids)
+      ? parsed.candidate_ids.filter((id) => typeof id === 'string' && validIds.has(id))
+      : [];
+
+    const confidence = parsed.confidence === 'high' && candidateIds.length === 1 ? 'high' : 'low';
+    const matched = confidence === 'high';
+    const memoId = matched ? candidateIds[0] : null;
+    const modifiedText = matched ? (normalizeText(parsed.modified_text ?? '') || null) : null;
+
+    // Enrich candidates with text from input (never trust model-generated text for candidates)
+    const candidateMap = new Map(safeMemos.map((m) => [m.id, m.text]));
+    const candidates = matched
+      ? []
+      : candidateIds.map((id) => ({ id, text: candidateMap.get(id) ?? '' })).filter((c) => c.text);
+
+    console.log('[relay-modify] /api/match-and-modify-memo result:', { matched, memo_id: memoId, confidence });
+
+    res.json({ ok: true, matched, memo_id: memoId, confidence, modified_text: modifiedText, candidates });
+  } catch (error) {
+    console.error('Failed to match-and-modify memo:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to match-and-modify memo',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+app.post('/api/interpret-yes-no', async (req, res) => {
+  try {
+    const { speech = '' } = req.body ?? {};
+    const cleanSpeech = normalizeText(speech);
+
+    if (!cleanSpeech) {
+      return res.status(400).json({ ok: false, error: 'Missing speech', message: 'A válasz szövege hiányzik.' });
+    }
+
+    console.log('[relay-yesno] POST /api/interpret-yes-no:', { speech: cleanSpeech });
+
+    const response = await client.responses.create({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          role: 'system',
+          content: [{
+            type: 'input_text',
+            text:
+              'Egy igen/nem kérdésre adott hangos választ kell értelmezned magyarul. ' +
+              'A bemenet egy automatikus hangfelismerő (STT) átirata — tartalmazhat kiejtési hibákat, ' +
+              'de teljes mondatokat is.\n\n' +
+              'Döntsd el, hogy a válasz IGENLŐ, TAGADÓ, vagy ÉRTELMEZHETETLEN:\n\n' +
+              '"yes" — egyértelműen igenlő szándék. Tipikus példák:\n' +
+              '  "igen", "igen, hozz létre egy új bejegyzést", "persze", "csináld", "jó", "oké",\n' +
+              '  "hozd létre", "igen kérlek", "aha", "naná", "rendben", "mehet", "legyen"\n\n' +
+              '"no" — egyértelműen tagadó szándék. Tipikus példák:\n' +
+              '  "nem", "ne", "ne csináld", "hagyd", "mégse", "inkább ne",\n' +
+              '  "nem kell", "felejtsd el", "ne csináld meg", "inkább nem"\n\n' +
+              '"unclear" — valóban kétértelmű, vagy nem igen/nem jellegű válasz.\n\n' +
+              'KRITIKUS SZABÁLY: a TELJES MONDAT SZÁNDÉKÁT nézd, ne egyes szavakat izoláltan. ' +
+              'Példák a helyes értelmezésre:\n' +
+              '  "Igen, hozz létre egy új bejegyzést." → yes (igenlő szándék, hiába hosszú mondat)\n' +
+              '  "Nem, inkább hagyd." → no (tagadó szándék)\n' +
+              '  "Hát... nem tudom." → unclear\n' +
+              'Ne adj "no"-t csak azért, mert a mondat nem tartalmazza az "igen" szót — ' +
+              'az igenlő szándék lehet implicit is.',
+          }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'input_text', text: cleanSpeech }],
+        },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'yes_no_answer',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              answer: { type: 'string', enum: ['yes', 'no', 'unclear'] },
+            },
+            required: ['answer'],
+          },
+        },
+      },
+    });
+
+    let parsed = { answer: 'unclear' };
+    try {
+      parsed = JSON.parse(response.output_text || '{}');
+    } catch (parseError) {
+      console.error('[relay-yesno] JSON parse error:', parseError);
+    }
+
+    const answer = ['yes', 'no', 'unclear'].includes(parsed.answer) ? parsed.answer : 'unclear';
+
+    console.log('[relay-yesno] result:', { answer, speech: cleanSpeech });
+
+    res.json({ ok: true, answer });
+  } catch (error) {
+    console.error('Failed to interpret yes/no:', error);
+    res.status(500).json({
+      ok: false,
+      error: 'Failed to interpret yes/no',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
 // ── WebSocket: /api/realtime-stt ────────────────────────────────────────────
 
 const wss = new WebSocketServer({ server, path: '/api/realtime-stt' });
