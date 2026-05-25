@@ -499,6 +499,7 @@ app.post('/api/query-memos', async (req, res) => {
                 '  – "Jó lenne megtanulni gitározni" → later\n\n' +
                 'SZABÁLYOK:\n' +
                 '  – Csak a megadott memo-kra hivatkozz, ne találj ki semmit\n' +
+                '  – Minden memo_id PONTOSAN EGY csoportban szerepeljen — ugyanaz a memo_id több csoportban NEM szerepelhet; rendelj minden memót a legmegfelelőbb egyetlen szinthez\n' +
                 '  – groups-ban csak nem üres csoportok szerepeljenek; sorrendjük: urgent, important, stale, later\n' +
                 '  – text_answer: rövid, természetes, TTS-barát összefoglaló (autóban hallgatva is érthető); ' +
                 'prioritized esetén a sürgős elemeket sorolja fel elsőként; text esetén is töltsd ki; ' +
