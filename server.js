@@ -1227,6 +1227,84 @@ app.post('/api/interpret-memo-action', async (req, res) => {
   }
 });
 
+app.post('/api/interpret-save-or-modify', async (req, res) => {
+  const { memoText, answer } = req.body ?? {};
+
+  if (typeof memoText !== 'string' || typeof answer !== 'string') {
+    return res.status(400).json({ ok: false, error: 'Missing memoText or answer' });
+  }
+
+  try {
+    const response = await client.responses.create({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          role: 'system',
+          content: [{
+            type: 'input_text',
+            text:
+              'Te egy magyar memó-asszisztens vagy. Felolvastuk a felhasználónak a memóját, és megkérdeztük: ' +
+              '"Mentsem el, vagy módosítanád?" A felhasználó most röviden válaszolt.\n\n' +
+              'Az input automatikus hangfelismerőből (STT) érkezik, ezért tartalmazhat ' +
+              'kiejtési hibát vagy érthetetlen töredéket.\n\n' +
+              'Osztályozd a választ az alábbi négy kategória egyikébe:\n\n' +
+              '- "save": a felhasználó el akarja menteni a memót változtatás nélkül. ' +
+              'Ide tartozik: "mentsd el", "ments", "igen", "jó", "oké", "rendben", "mehet", ' +
+              '"elmentheted", "így jó", "hagyd így", "legyen", "jo", "oke", "okay", ' +
+              '"mentsük", "elmentem" — és STT-hiba esetén hasonló hangzású szavak ' +
+              '("menj el" valójában "mentsd el" lehet).\n\n' +
+              '- "cancel": a felhasználó el akarja dobni, nem menti el. ' +
+              'Ide tartozik: "mégse", "hagyd", "ne mentsd", "töröld", "felejtsd el", ' +
+              '"dobd el", "nem kell", "eldobom".\n\n' +
+              '- "modify": a felhasználó módosítani akarja a memó szövegét — konkrét változtatási ' +
+              'utasítást ad (pl. "tedd hozzá hogy sürgős", "inkább holnap", "változtasd meg..."). ' +
+              'Ha az action "modify", alkalmazd az utasítást a memó szövegére és add vissza a ' +
+              'modified_text mezőben a teljes, módosított szöveget.\n\n' +
+              '- "unclear": a válasz üres, érthetetlen, zaj, töredék, vagy nem sorolható be ' +
+              'egyértelműen a fenti kategóriák egyikébe sem.\n\n' +
+              'Fontos: az EGÉSZ rövid válasz SZÁNDÉKÁT nézd, ne egyes szavakat. ' +
+              '"Mentsd el" egyértelműen save. Soha ne adj "unclear"-t, ha az egyértelmű save/cancel/modify.',
+          }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: `Memó szövege: "${memoText}"\n\nFelhasználó válasza: "${answer}"`,
+          }],
+        },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'save_or_modify',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              action: { type: 'string', enum: ['save', 'cancel', 'modify', 'unclear'] },
+              modified_text: { type: ['string', 'null'] },
+            },
+            required: ['action', 'modified_text'],
+          },
+        },
+      },
+    });
+
+    let parsed = { action: 'unclear', modified_text: null };
+    try { parsed = JSON.parse(response.output_text || '{}'); } catch {}
+
+    if (!['save', 'cancel', 'modify', 'unclear'].includes(parsed.action)) parsed.action = 'unclear';
+
+    console.log('[relay] /api/interpret-save-or-modify:', { answer, action: parsed.action });
+    res.json({ ok: true, action: parsed.action, modified_text: parsed.modified_text ?? null });
+  } catch (error) {
+    console.error('interpret-save-or-modify error:', error);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post('/api/extract-shopping-items', async (req, res) => {
   const { memos } = req.body ?? {};
 
@@ -1443,25 +1521,39 @@ app.post('/api/detect-intent', async (req, res) => {
             type: 'input_text',
             text:
               'Magyar hangbemondásból döntsd el, mit szeretne a felhasználó egy hangjegyzet-alkalmazásban.\n\n' +
-              'Három szándék egyike lehetséges. CSAK KÉT SZÁNDÉKOT azonosíts aktívan — minden más az alapértelmezett.\n\n' +
-              '"new_memo" — KIZÁRÓLAG akkor, ha a felhasználó egyértelműen ÚJ rögzítési szándékot fejez ki ' +
-              'rövid, jellegzetes "most kezdek diktálni" fordulattal. Tipikus példák:\n' +
-              '  – "mondom", "mondanék valamit", "mondok valamit"\n' +
-              '  – "új bejegyzés", "új jegyzet", "feljegyeznék valamit"\n' +
-              '  – "diktálok", "diktálnék", "felvenném", "rögzítek valamit"\n' +
-              '  – "megjegyeznék valamit", "felírnék valamit"\n' +
-              'Ezek rövid szándéknyilatkozatok — NEM teljes tartalom (pl. "holnap orvos" nem ide tartozik).\n\n' +
-              '"query" — KIZÁRÓLAG akkor, ha a felhasználó egyértelműen kérdez, keres vagy áttekintést kér. Tipikus példák:\n' +
-              '  – "kérdezek", "kérdeznék valamit", "kérdésem van"\n' +
-              '  – "mi a dolgom", "mi sürgős", "mit kell elvégeznem", "mi van a listán"\n' +
-              '  – "listázd", "sorold fel", "foglald össze", "mutasd meg"\n' +
-              '  – "készíts bevásárló listát", "mi a legfontosabb", "mivel kezdjem"\n\n' +
-              '"modify_memo" — MINDEN MÁS. Ha a szöveg nem illik egyértelműen a fenti két kategória egyikébe, ' +
-              'a válasz: "modify_memo". A felhasználó feltételezhetően egy meglévő bejegyzést javít, egészít ki, ' +
-              'vagy tartalom-jellegű mondatot mond — amit a rendszer megpróbál meglévő bejegyzéshez rendelni.\n\n' +
-              'KRITIKUS SZABÁLY: NE próbáld felismerni a módosítási jeleket — csak a két szűk kategóriát ' +
-              '(new_memo, query) azonosítsd aktívan. Kétség esetén az alapértelmezett: "modify_memo".\n' +
-              'Csak a szándékot azonosítsd, ne javítsd a szöveget.',
+              'A szándékot a MONDAT ELEJE határozza meg — egy explicit nyitófordulat. ' +
+              'A mondatforma (kérdő/állító) ÖNMAGÁBAN NEM számít.\n\n' +
+              '1. "query" — CSAK ha a bemondás egy explicit lekérdezési/parancsoló nyitóval KEZDŐDIK:\n' +
+              '  "kérdezek", "kérdeznék", "van egy kérdésem", "kérdésem van", "az a kérdésem hogy",\n' +
+              '  "válaszolj", "keresd", "keress", "listázd", "mutasd", "foglald össze",\n' +
+              '  "mi a dolgom", "mi sürgős", "készíts bevásárló listát"\n' +
+              '  ✓ "Kérdezek: mi a legfontosabb teendőm?" → query\n' +
+              '  ✓ "Listázd az aktív feljegyzéseimet." → query\n' +
+              '  ✓ "Kérdeznék valamit." → query (a tényleges kérdés ezután jön)\n' +
+              '  ✗ "Mikor lesz időm erre?" → new_memo (kérdő forma, de nincs query-nyitó)\n' +
+              '  ✗ "Kit kéne felhívnom holnap?" → new_memo (kérdő forma, de nincs query-nyitó)\n' +
+              '  ✗ "Vegyek-e tejet?" → new_memo (gondolat/teendő, nem app-lekérdezés)\n\n' +
+              '2. "modify_memo" — CSAK ha a bemondás egy korrekciós nyitóval KEZDŐDIK:\n' +
+              '  "mégsem", "nem " (korrekciós tagadás), "inkább", "módosítom", "módosítanám",\n' +
+              '  "talán inkább", "javítom", "helyette", "mégis", "pontosítom"\n' +
+              '  ✓ "Inkább holnapután megyek." → modify_memo\n' +
+              '  ✓ "Nem holnap, hanem pénteken." → modify_memo\n' +
+              '  ✗ "Holnap megyek a fogorvoshoz." → new_memo\n\n' +
+              '3. "new_memo" — MINDEN MÁS, beleértve a kérdő formájú mondatokat nyitó nélkül.\n\n' +
+              'Alapértelmezett: "new_memo". Kétség esetén mindig new_memo.\n\n' +
+              '---\n\n' +
+              'Ezután döntsd el a "has_content" mezőt:\n\n' +
+              'new_memo esetén:\n' +
+              '  has_content = false — ha a bemondás CSAK egy rögzítési szándéknyitó, tényleges tartalom nélkül:\n' +
+              '    "új bejegyzés", "mondom", "jegyzetelek", "felveszek valamit", "diktálok", "új jegyzet"\n' +
+              '  has_content = true — ha van tényleges tartalom is:\n' +
+              '    "ma megyünk moziba", "mondom hogy vegyél tejet", "vegyél kenyeret"\n\n' +
+              'query esetén:\n' +
+              '  has_content = false — ha a bemondás CSAK egy lekérdezési nyitó, tényleges kérdés nélkül:\n' +
+              '    "kérdezek", "van egy kérdésem", "kérdésem van"\n' +
+              '  has_content = true — ha tartalmaz tényleges kérdést is:\n' +
+              '    "mi a dolgom ma", "az a kérdésem hogy mi sürgős", "listázd az aktív feljegyzéseimet"\n\n' +
+              'modify_memo esetén: has_content = true (a korrekció mindig tartalmaz információt).',
           }],
         },
         {
@@ -1479,25 +1571,27 @@ app.post('/api/detect-intent', async (req, res) => {
             additionalProperties: false,
             properties: {
               intent: { type: 'string', enum: ['new_memo', 'query', 'modify_memo'] },
+              has_content: { type: 'boolean' },
             },
-            required: ['intent'],
+            required: ['intent', 'has_content'],
           },
         },
       },
     });
 
-    let parsed = { intent: 'new_memo' };
+    let parsed = { intent: 'new_memo', has_content: true };
     try {
       parsed = JSON.parse(response.output_text || '{}');
     } catch (parseError) {
       console.error('[relay-intent] JSON parse error:', parseError);
     }
 
-    const intent = ['new_memo', 'query'].includes(parsed.intent) ? parsed.intent : 'modify_memo';
+    const intent = ['new_memo', 'query', 'modify_memo'].includes(parsed.intent) ? parsed.intent : 'new_memo';
+    const has_content = intent === 'modify_memo' ? true : Boolean(parsed.has_content);
 
-    console.log('[relay-intent] result:', { intent, text: inputText });
+    console.log('[relay-intent] result:', { intent, has_content, text: inputText });
 
-    res.json({ ok: true, intent, text: inputText });
+    res.json({ ok: true, intent, text: inputText, has_content });
   } catch (error) {
     console.error('Failed to detect intent:', error);
     res.status(500).json({
